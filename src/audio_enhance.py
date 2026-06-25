@@ -59,29 +59,60 @@ def separate_vocals_demucs(
     model_name = cfg["demucs"]["model"]
 
     try:
-        from demucs import separate
-        from demucs.api import Separator
+        import demucs.separate
+        from demucs import pretrained
+        from demucs.apply import apply_model
+        import soundfile as sf
     except ImportError:
         raise ImportError("请安装 demucs: pip install demucs")
 
     audio_path = str(audio_path)
-    out_dir = str(Path(temp_dir) / "demucs_output")
 
-    logger.info(f"分离中 (模型: {model_name}, 设备: {device})...")
+    device_torch = get_device(device)
+    logger.info(f"分离中 (模型: {model_name}, 设备: {device_torch})...")
+
     try:
-        separator = Separator(model=model_name, device=device)
-        _, separated = separator.separate_audio_file(audio_path)
-        # 获取 vocals 轨道
-        vocals = separated["vocals"]  # tensor, shape: (channels, samples)
-        vocals_sr = separator.samplerate
-    except Exception:
+        # 加载模型
+        model = pretrained.get_model(model_name)
+        model.to(device_torch)
+        model.eval()
+
+        # 加载音频（使用 soundfile 避免 torchcodec 依赖）
+        data, sr = sf.read(audio_path, dtype="float32")
+        if data.ndim == 1:
+            data = data[:, np.newaxis]
+        # Demucs htdemucs 期望至少 2 通道
+        if data.shape[1] == 1:
+            data = np.repeat(data, 2, axis=1)
+        wav = torch.from_numpy(data.T).float().to(device_torch)
+
+        # 应用模型分离
+        with torch.no_grad():
+            sources = apply_model(
+                model, wav[None],
+                device=device_torch,
+                shifts=1,
+                split=True,
+                overlap=0.25,
+                progress=True,
+            )[0]
+
+        # 提取 vocals（通常是第一个源）
+        vocals = sources[0].cpu()  # shape: (channels, samples)
+        vocals_sr = model.samplerate
+
+    except Exception as e:
+        logger.error(f"Demucs API 分离失败: {e}")
         # 回退到命令行方式
-        logger.warning("API 模式失败，使用命令行分离...")
+        logger.warning("回退到命令行方式...")
         import subprocess
+        # 使用实际可用设备
+        cmd_device = "cpu" if device_torch.type == "cpu" else device
+        out_dir = str(Path(temp_dir) / "demucs_output")
         cmd = [
             sys.executable, "-m", "demucs",
             "-n", model_name,
-            "-d", device,
+            "-d", cmd_device,
             "--two-stems", "vocals",
             "-o", out_dir,
             audio_path,
@@ -89,7 +120,6 @@ def separate_vocals_demucs(
         subprocess.run(cmd, check=True)
 
         # 查找输出的 vocals 文件
-        audio_name = Path(audio_path).stem
         vocals_path = None
         for root, dirs, files in os.walk(out_dir):
             for f in files:
@@ -103,7 +133,11 @@ def separate_vocals_demucs(
 
     # 保存 vocals
     vocals_path = str(Path(temp_dir) / "vocals_separated.wav")
-    torchaudio.save(vocals_path, vocals.cpu(), vocals_sr)
+    vocals_np = vocals.squeeze().numpy().astype(np.float32)
+    # soundfile 期望 (samples, channels) 格式
+    if vocals_np.ndim == 2:
+        vocals_np = vocals_np.T
+    sf.write(vocals_path, vocals_np, vocals_sr)
     logger.info(f"人声分离完成: {vocals_path}")
     return vocals_path
 
@@ -424,6 +458,7 @@ def extract_speaker_embedding(
 
     target_sr = cfg["audio"]["target_sample_rate"]
     device_str = cfg["speaker_encoder"]["device"]
+    model_name = cfg["speaker_encoder"]["model_name"]
     device = get_device(device_str)
 
     # 加载音频（24kHz 单声道）
@@ -435,16 +470,27 @@ def extract_speaker_embedding(
     # 尝试 WeSpeaker
     try:
         _apply_wespeaker_patches()
-        from wespeaker.inference import SpeakerEncoder
-        model_name = cfg["speaker_encoder"]["model_name"]
-        encoder = SpeakerEncoder(model_name)
+        from wespeaker.cli.speaker import load_model
+
+        # WeSpeaker 使用 load_model 加载，然后调用 extract_embedding
+        encoder = load_model(model_name)
         encoder.model.to(device)
         encoder.model.eval()
 
         with torch.no_grad():
-            wav = waveform.to(device)
-            embedding = encoder.encode(wav)
+            if hasattr(encoder, 'extract_embedding_from_pcm'):
+                wav = waveform.to(device)
+                embedding = encoder.extract_embedding_from_pcm(wav, target_sr)
+            elif hasattr(encoder, 'extract_embedding'):
+                # 使用临时文件方式
+                embedding = encoder.extract_embedding(audio_path)
+            else:
+                raise AttributeError("WeSpeaker encoder 不支持 extract_embedding")
+
+        if isinstance(embedding, torch.Tensor):
             embedding = embedding.squeeze().cpu().numpy()
+        elif isinstance(embedding, np.ndarray):
+            embedding = embedding.squeeze()
 
         logger.info(f"使用 WeSpeaker ({model_name}) 提取音色向量")
     except Exception as e:
@@ -457,7 +503,7 @@ def extract_speaker_embedding(
             encoder = VoiceEncoder(device=device)
 
             wav_np = waveform.squeeze().cpu().numpy()
-            embedding = encoder.embed_utterance(wav_np, sr=target_sr)
+            embedding = encoder.embed_utterance(wav_np)
             logger.info("使用 Resemblyzer 提取音色向量")
         except Exception as e:
             raise RuntimeError(f"音色提取失败 (WeSpeaker + Resemblyzer 均不可用): {e}")

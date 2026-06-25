@@ -67,15 +67,19 @@ def get_device(device_str: str) -> torch.device:
 # ── 音频 I/O ─────────────────────────────────────────────────
 def load_audio(file_path: str, target_sr: int = None) -> Tuple[torch.Tensor, int]:
     """加载音频文件，自动处理格式（wav / mp3 / m4a 等）"""
+    import soundfile as sf
     file_path = str(file_path)
     try:
-        waveform, sr = torchaudio.load(file_path)
-    except Exception:
-        # 尝试用 soundfile 加载
-        data, sr = sf.read(file_path)
+        data, sr = sf.read(file_path, dtype="float32")
         if data.ndim == 1:
             data = data[:, np.newaxis]
         waveform = torch.from_numpy(data.T).float()
+    except Exception:
+        # 回退到 torchaudio（如果安装了 torchcodec）
+        try:
+            waveform, sr = torchaudio.load(file_path)
+        except Exception:
+            raise RuntimeError(f"无法加载音频文件: {file_path}")
 
     if target_sr and sr != target_sr:
         resampler = torchaudio.transforms.Resample(sr, target_sr)
@@ -92,20 +96,23 @@ def save_audio(
     normalize: bool = True,
 ):
     """保存音频为 wav 文件"""
+    import soundfile as sf
     file_path = Path(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
-    wav = waveform.detach().cpu()
-    if wav.dim() == 1:
-        wav = wav.unsqueeze(0)
+    wav = waveform.detach().cpu().squeeze().numpy().astype(np.float32)
 
     # 防止削波
     if normalize:
-        peak = wav.abs().max()
+        peak = np.abs(wav).max()
         if peak > 1.0:
             wav = wav / peak
 
-    torchaudio.save(str(file_path), wav, sr)
+    # soundfile 期望 (samples,) 或 (samples, channels)
+    if wav.ndim == 2 and wav.shape[0] <= 2:
+        wav = wav.T  # (channels, samples) -> (samples, channels)
+
+    sf.write(str(file_path), wav, sr)
     logger.info(f"音频已保存: {file_path}")
 
 

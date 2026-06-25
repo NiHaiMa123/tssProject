@@ -117,7 +117,8 @@ def generate_demo_audio(temp_dir: Path) -> Optional[str]:
     waveform = signal.unsqueeze(0)
 
     audio_path = str(temp_dir / "demo_synthetic.wav")
-    torchaudio.save(audio_path, waveform, sr)
+    import soundfile as sf
+    sf.write(audio_path, waveform.squeeze().cpu().numpy(), sr)
     logger.info(f"合成测试音频已生成: {audio_path}")
     return audio_path
 
