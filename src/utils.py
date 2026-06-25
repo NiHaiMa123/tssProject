@@ -32,6 +32,37 @@ def setup_logger(verbose: bool = False):
     logger.setLevel(level)
 
 
+# ── 模型路径设置（确保所有模型从本地 models/ 加载） ─────────────
+def setup_model_paths(cfg: dict = None):
+    """
+    设置各模型库的缓存路径，统一指向项目内 models/ 目录
+    确保 git pull 后无需额外下载即可使用
+    """
+    import os
+
+    project_root = Path(__file__).resolve().parent.parent
+    models_dir = project_root / "models"
+    if cfg and cfg.get("paths", {}).get("models_dir"):
+        models_dir = Path(cfg["paths"]["models_dir"])
+
+    models_dir = Path(models_dir).resolve()
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    # Demucs / Torch Hub
+    torch_hub_dir = models_dir / "torch_hub"
+    torch_hub_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["TORCH_HOME"] = str(torch_hub_dir)
+
+    # HuggingFace Hub
+    hf_cache_dir = models_dir / "huggingface"
+    hf_cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(hf_cache_dir)
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_cache_dir)
+
+    logger.debug(f"模型缓存目录: {models_dir}")
+    return models_dir
+
+
 # ── 配置 ─────────────────────────────────────────────────────
 def load_config(config_path: str = "config.yaml") -> dict:
     """加载 YAML 配置文件"""

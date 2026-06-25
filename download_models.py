@@ -59,7 +59,7 @@ def download_chattts():
 
 
 def download_demucs():
-    """下载 Demucs htdemucs 模型权重"""
+    """下载 Demucs htdemucs 模型权重到 models/torch_hub/"""
     print("=" * 50)
     print("下载 Demucs htdemucs 模型权重...")
     print("=" * 50)
@@ -68,10 +68,14 @@ def download_demucs():
         import torch
         from demucs import pretrained
 
+        # 设置 Torch Hub 缓存目录为本地 models/torch_hub
+        torch_hub_dir = MODELS_DIR / "torch_hub"
+        torch_hub_dir.mkdir(parents=True, exist_ok=True)
+        torch.hub.set_dir(str(torch_hub_dir))
+
         # 加载模型会自动下载权重
         model = pretrained.get_model("htdemucs")
-        # 模型权重在 torch hub 缓存中
-        print("  Demucs htdemucs 模型已下载到 PyTorch Hub 缓存")
+        print(f"  Demucs htdemucs 模型已保存至: {torch_hub_dir}")
         return True
     except Exception as e:
         print(f"  Demucs 下载失败: {e}")
@@ -79,22 +83,19 @@ def download_demucs():
 
 
 def download_silero_vad():
-    """下载 Silero VAD 模型"""
+    """下载 Silero VAD 模型到 models/silero_vad/"""
     print("=" * 50)
     print("下载 Silero VAD 模型...")
     print("=" * 50)
 
     try:
-        import torch
-        # Silero VAD 模型会自动下载
-        model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-            onnx=False,
-            trust_repo=True,
-        )
-        print("  Silero VAD 模型已下载")
+        from silero_vad import load_silero_vad, get_speech_timestamps
+        
+        output_dir = MODELS_DIR / "silero_vad"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        model = load_silero_vad(model_dir=str(output_dir))
+        print(f"  Silero VAD 模型已保存至: {output_dir}")
         return True
     except Exception as e:
         print(f"  Silero VAD 下载失败: {e}")
@@ -131,16 +132,40 @@ def download_wespeaker():
 
 
 def download_resemblyzer():
-    """下载 Resemblyzer 模型权重"""
+    """下载 Resemblyzer 模型权重到 models/resemblyzer/"""
     print("=" * 50)
     print("下载 Resemblyzer 模型权重...")
     print("=" * 50)
 
     try:
         from resemblyzer import VoiceEncoder
-        # 加载模型会自动下载
+        from resemblyzer.audio import preprocess_wav
+        
+        output_dir = MODELS_DIR / "resemblyzer"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / "pretrained.pt"
+        
+        if output_path.exists():
+            print(f"  Resemblyzer 模型已存在: {output_path}")
+            return True
+        
+        # 加载模型会自动下载，然后我们找到缓存的文件复制过来
         encoder = VoiceEncoder()
-        print("  Resemblyzer 模型已下载")
+        
+        # 找到 resemblyzer 的模型缓存路径
+        import resemblyzer
+        import inspect
+        resemblyzer_dir = Path(inspect.getfile(resemblyzer)).parent
+        default_model_path = resemblyzer_dir / "pretrained.pt"
+        
+        if default_model_path.exists():
+            import shutil
+            shutil.copy2(str(default_model_path), str(output_path))
+            print(f"  Resemblyzer 模型已保存至: {output_path}")
+        else:
+            # 尝试从 VoiceEncoder 实例获取模型路径
+            print("  无法定位 Resemblyzer 模型文件，模型将在首次运行时自动下载")
+        
         return True
     except Exception as e:
         print(f"  Resemblyzer 下载失败: {e}")

@@ -260,7 +260,16 @@ def detect_speech_segments(
     except ImportError:
         raise ImportError("请安装 silero-vad: pip install silero-vad")
 
-    model = load_silero_vad()
+    project_root = Path(__file__).resolve().parent.parent
+    silero_model_dir = project_root / "models" / "silero_vad"
+    
+    if silero_model_dir.exists():
+        model = load_silero_vad(model_dir=str(silero_model_dir))
+        logger.debug("使用本地 Silero VAD 模型")
+    else:
+        model = load_silero_vad()
+        logger.debug("使用默认 Silero VAD 模型（自动下载）")
+    
     wav = waveform.squeeze().cpu().numpy()
 
     # Silero VAD 期望 16kHz
@@ -500,7 +509,14 @@ def extract_speaker_embedding(
     if embedding is None:
         try:
             from resemblyzer import VoiceEncoder
-            encoder = VoiceEncoder(device=device)
+            project_root = Path(__file__).resolve().parent.parent
+            resemblyzer_model_path = project_root / "models" / "resemblyzer" / "pretrained.pt"
+            if resemblyzer_model_path.exists():
+                encoder = VoiceEncoder(device=device, weights_fpath=str(resemblyzer_model_path))
+                logger.info("使用本地 Resemblyzer 模型")
+            else:
+                encoder = VoiceEncoder(device=device)
+                logger.info("使用默认 Resemblyzer 模型（自动下载）")
 
             wav_np = waveform.squeeze().cpu().numpy()
             embedding = encoder.embed_utterance(wav_np)

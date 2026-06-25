@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils import (
-    logger, setup_logger, load_config, ensure_dirs,
+    logger, setup_logger, load_config, ensure_dirs, setup_model_paths,
     find_audio_files, find_text_files, check_user_data_exists,
     cleanup_temp,
 )
@@ -53,6 +53,10 @@ def main():
 
     # 加载配置
     cfg = load_config(args.config)
+
+    # 统一设置模型缓存路径（必须在加载任何模型前调用）
+    setup_model_paths(cfg)
+
     ensure_dirs(cfg)
 
     logger.info("=" * 60)
