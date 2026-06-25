@@ -1,0 +1,459 @@
+"""
+模块 1：参考音频全自动增强与音色提取
+─────────────────────────────────────────
+流程：人声分离 → 去混响 → 语音增强 → 最优片段选取 → 响度归一化 → 音色嵌入提取
+"""
+
+import os
+import sys
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Optional, Tuple, List
+
+import numpy as np
+import torch
+import torchaudio
+import torchaudio.functional as F
+
+from .utils import (
+    logger, load_config, get_device, ensure_dirs,
+    load_audio, save_audio, convert_to_mono,
+    ebu_r128_normalize, find_audio_files,
+)
+
+
+# ══════════════════════════════════════════════════════════════
+# 1.1 人声分离 (Demucs)
+# ══════════════════════════════════════════════════════════════
+
+def separate_vocals_demucs(
+    audio_path: str,
+    cfg: dict,
+    temp_dir: str = "temp",
+) -> str:
+    """
+    使用 Demucs htdemucs 模型分离人声
+    返回: 纯人声文件路径
+    """
+    logger.info("=" * 50)
+    logger.info("步骤 1.1: 人声分离 (Demucs htdemucs)")
+    logger.info("=" * 50)
+
+    device = cfg["demucs"]["device"]
+    model_name = cfg["demucs"]["model"]
+
+    try:
+        from demucs import separate
+        from demucs.api import Separator
+    except ImportError:
+        raise ImportError("请安装 demucs: pip install demucs")
+
+    audio_path = str(audio_path)
+    out_dir = str(Path(temp_dir) / "demucs_output")
+
+    logger.info(f"分离中 (模型: {model_name}, 设备: {device})...")
+    try:
+        separator = Separator(model=model_name, device=device)
+        _, separated = separator.separate_audio_file(audio_path)
+        # 获取 vocals 轨道
+        vocals = separated["vocals"]  # tensor, shape: (channels, samples)
+        vocals_sr = separator.samplerate
+    except Exception:
+        # 回退到命令行方式
+        logger.warning("API 模式失败，使用命令行分离...")
+        import subprocess
+        cmd = [
+            sys.executable, "-m", "demucs",
+            "-n", model_name,
+            "-d", device,
+            "--two-stems", "vocals",
+            "-o", out_dir,
+            audio_path,
+        ]
+        subprocess.run(cmd, check=True)
+
+        # 查找输出的 vocals 文件
+        audio_name = Path(audio_path).stem
+        vocals_path = None
+        for root, dirs, files in os.walk(out_dir):
+            for f in files:
+                if f.endswith(".wav") and "vocals" in f.lower():
+                    vocals_path = os.path.join(root, f)
+                    break
+        if vocals_path is None:
+            raise FileNotFoundError("未找到 Demucs 输出的 vocals 文件")
+        logger.info(f"人声分离完成: {vocals_path}")
+        return vocals_path
+
+    # 保存 vocals
+    vocals_path = str(Path(temp_dir) / "vocals_separated.wav")
+    torchaudio.save(vocals_path, vocals.cpu(), vocals_sr)
+    logger.info(f"人声分离完成: {vocals_path}")
+    return vocals_path
+
+
+# ══════════════════════════════════════════════════════════════
+# 1.2 去混响与语音增强 (Resemble Enhance)
+# ══════════════════════════════════════════════════════════════
+
+def enhance_audio_resemble(
+    audio_path: str,
+    cfg: dict,
+    temp_dir: str = "temp",
+) -> str:
+    """
+    使用 Resemble Enhance 进行去混响 + 语音增强
+    返回: 增强后音频路径
+    """
+    logger.info("=" * 50)
+    logger.info("步骤 1.2: 语音增强 (Resemble Enhance)")
+    logger.info("=" * 50)
+
+    if not cfg["enhance"]["enabled"]:
+        logger.info("增强已禁用，跳过")
+        return audio_path
+
+    device = cfg["enhance"]["device"]
+    target_sr = cfg["audio"]["enhance_sample_rate"]
+
+    try:
+        from resemble_enhance.enhancer.inference import enhance
+        import torchaudio
+    except ImportError:
+        raise ImportError("请安装 resemble-enhance: pip install resemble-enhance")
+
+    # 加载音频并升频到 48kHz
+    waveform, sr = load_audio(audio_path, target_sr=target_sr)
+    waveform = convert_to_mono(waveform)
+
+    logger.info(f"增强中 (采样率: {target_sr}Hz, 设备: {device})...")
+
+    try:
+        # Resemble Enhance 增强
+        device_torch = get_device(device)
+        enhanced = enhance(
+            dwav=waveform,
+            sr=target_sr,
+            device=device_torch,
+            nfe=32,                         # 推理步数
+            solver="midpoint",              # 采样器
+            lambd=0.9 if cfg["enhance"]["dereverb"] else 1.0,  # 去混响强度
+            tau=0.5,                        # 降噪强度
+        )
+    except Exception as e:
+        logger.error(f"Resemble Enhance 增强失败: {e}")
+        logger.warning("回退到原始音频")
+        return audio_path
+
+    # 保存增强音频
+    enhanced_path = str(Path(temp_dir) / "enhanced.wav")
+    save_audio(enhanced, target_sr, enhanced_path)
+    logger.info(f"语音增强完成: {enhanced_path}")
+    return enhanced_path
+
+
+# ══════════════════════════════════════════════════════════════
+# 1.3 最优参考片段自动选取 (Silero VAD + DNSMOS)
+# ══════════════════════════════════════════════════════════════
+
+def detect_speech_segments(
+    waveform: torch.Tensor,
+    sr: int,
+    cfg: dict,
+) -> List[Tuple[float, float]]:
+    """
+    使用 Silero VAD 检测语音段
+    返回: [(start_sec, end_sec), ...]
+    """
+    try:
+        from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
+    except ImportError:
+        raise ImportError("请安装 silero-vad: pip install silero-vad")
+
+    model = load_silero_vad()
+    wav = waveform.squeeze().cpu().numpy()
+
+    # Silero VAD 期望 16kHz
+    if sr != 16000:
+        resampler = torchaudio.transforms.Resample(sr, 16000)
+        wav_16k = resampler(waveform).squeeze().cpu().numpy()
+    else:
+        wav_16k = wav
+
+    timestamps = get_speech_timestamps(
+        wav_16k,
+        model,
+        threshold=cfg["vad"]["threshold"],
+        min_speech_duration_ms=cfg["vad"]["min_speech_duration_ms"],
+        min_silence_duration_ms=cfg["vad"]["min_silence_duration_ms"],
+        return_seconds=True,
+    )
+
+    segments = [(ts["start"], ts["end"]) for ts in timestamps]
+    logger.info(f"VAD 检测到 {len(segments)} 个语音段")
+    return segments
+
+
+def compute_dnsmos(waveform: torch.Tensor, sr: int) -> float:
+    """
+    使用 DNSMOS 评估语音质量
+    返回: MOS 分数 (1~5)
+    """
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        logger.warning("onnxruntime 未安装，跳过 DNSMOS 评分")
+        return 3.0
+
+    # 简化的 DNSMOS 实现：基于信号特征估算
+    # 实际使用中应加载 ONNX 模型，此处为占位
+    wav = waveform.squeeze().cpu().numpy()
+
+    # 基于信噪比和能量估算质量分数
+    eps = 1e-8
+    energy = np.mean(wav ** 2)
+    if energy < eps:
+        return 1.0
+
+    # 高频能量占比（明亮度指标）
+    if len(wav) > 1024:
+        spec = np.abs(np.fft.rfft(wav))
+        high_band = spec[len(spec)//2:]
+        low_band = spec[:len(spec)//2]
+        high_ratio = np.sum(high_band) / (np.sum(low_band) + eps)
+    else:
+        high_ratio = 0.5
+
+    # 零交叉率（清浊音指标）
+    zcr = np.mean(np.abs(np.diff(np.sign(wav)))) / 2.0
+
+    # 综合评分
+    score = 3.0 + 0.5 * high_ratio - 0.3 * abs(zcr - 0.1)
+    score = max(1.0, min(5.0, score))
+    return float(score)
+
+
+def select_best_segment(
+    waveform: torch.Tensor,
+    sr: int,
+    segments: List[Tuple[float, float]],
+    cfg: dict,
+) -> Tuple[torch.Tensor, float]:
+    """
+    从语音段中选出质量最优的一段（10~15 秒）
+    返回: (最优片段 waveform, 质量分数)
+    """
+    min_dur = cfg["audio"]["segment_duration_min"]
+    max_dur = cfg["audio"]["segment_duration_max"]
+    mos_threshold = cfg["dnsmos"]["threshold"]
+
+    candidates = []
+    for start, end in segments:
+        duration = end - start
+        # 过滤太短的段
+        if duration < 1.0:
+            continue
+
+        start_sample = int(start * sr)
+        end_sample = int(end * sr)
+        seg = waveform[:, start_sample:end_sample]
+
+        # 计算 DNSMOS
+        mos = compute_dnsmos(seg, sr)
+        if mos < mos_threshold:
+            continue
+
+        # 截取目标长度
+        if duration > max_dur:
+            # 取中间最稳定的部分
+            mid = len(seg.squeeze()) // 2
+            half = int(max_dur * sr // 2)
+            seg = seg[:, mid - half:mid + half]
+            duration = max_dur
+
+        if duration >= min_dur:
+            candidates.append((seg, mos, duration))
+
+    if not candidates:
+        # 放宽条件，取最长的一段
+        logger.warning("未找到满足质量要求的片段，取最长语音段")
+        if segments:
+            longest = max(segments, key=lambda x: x[1] - x[0])
+            start_sample = int(longest[0] * sr)
+            end_sample = int(longest[1] * sr)
+            duration = longest[1] - longest[0]
+            seg = waveform[:, start_sample:end_sample]
+            if duration > max_dur:
+                mid = len(seg.squeeze()) // 2
+                half = int(max_dur * sr // 2)
+                seg = seg[:, mid - half:mid + half]
+            candidates.append((seg, 3.0, min(duration, max_dur)))
+        else:
+            # 没有任何语音段，使用整个音频
+            logger.warning("未检测到语音段，使用整个音频")
+            wav = waveform
+            if wav.shape[-1] / sr > max_dur:
+                mid = wav.shape[-1] // 2
+                half = int(max_dur * sr // 2)
+                wav = wav[:, mid - half:mid + half]
+            candidates.append((wav, 3.0, min(wav.shape[-1] / sr, max_dur)))
+
+    # 选择质量最高的
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    best_seg, best_mos, best_dur = candidates[0]
+    logger.info(f"最优片段: 时长 {best_dur:.1f}s, DNSMOS {best_mos:.2f}")
+    return best_seg, best_mos
+
+
+def prepare_reference_segment(
+    enhanced_path: str,
+    cfg: dict,
+    temp_dir: str = "temp",
+) -> str:
+    """
+    从增强音频中选取最优参考片段，做响度归一化，转换到 24kHz 单声道
+    返回: 参考片段路径
+    """
+    logger.info("=" * 50)
+    logger.info("步骤 1.3: 最优参考片段选取")
+    logger.info("=" * 50)
+
+    target_sr = cfg["audio"]["target_sample_rate"]
+    target_lufs = cfg["audio"]["ebu_r128_target_db"]
+
+    # 加载增强音频
+    waveform, sr = load_audio(enhanced_path)
+    waveform = convert_to_mono(waveform)
+
+    # VAD 检测语音段
+    segments = detect_speech_segments(waveform, sr, cfg)
+
+    # 选择最优片段
+    best_seg, mos = select_best_segment(waveform, sr, segments, cfg)
+
+    # 重采样到 24kHz
+    if sr != target_sr:
+        resampler = torchaudio.transforms.Resample(sr, target_sr)
+        best_seg = resampler(best_seg)
+        sr = target_sr
+
+    # EBU R128 响度归一化
+    best_seg = ebu_r128_normalize(best_seg, sr, target_lufs)
+
+    # 保存
+    ref_path = str(Path(temp_dir) / "reference_segment.wav")
+    save_audio(best_seg, sr, ref_path)
+    logger.info(f"参考片段已保存: {ref_path} (MOS: {mos:.2f})")
+    return ref_path
+
+
+# ══════════════════════════════════════════════════════════════
+# 1.4 说话人音色嵌入提取 (WeSpeaker)
+# ══════════════════════════════════════════════════════════════
+
+def extract_speaker_embedding(
+    audio_path: str,
+    cfg: dict,
+    output_dir: str = "output/speaker_emb",
+    speaker_name: str = "speaker",
+) -> str:
+    """
+    使用 WeSpeaker 提取说话人音色向量
+    返回: 保存的 .npy 文件路径
+    """
+    logger.info("=" * 50)
+    logger.info("步骤 1.4: 说话人音色嵌入提取 (WeSpeaker)")
+    logger.info("=" * 50)
+
+    target_sr = cfg["audio"]["target_sample_rate"]
+    device_str = cfg["speaker_encoder"]["device"]
+    model_name = cfg["speaker_encoder"]["model_name"]
+    device = get_device(device_str)
+
+    try:
+        from wespeaker.inference import SpeakerEncoder
+    except ImportError:
+        raise ImportError("请安装 wespeaker: pip install wespeaker")
+
+    # 加载音频（24kHz 单声道）
+    waveform, sr = load_audio(audio_path, target_sr=target_sr)
+    waveform = convert_to_mono(waveform)
+
+    # 初始化说话人编码器
+    encoder = SpeakerEncoder(model_name)
+    encoder.model.to(device)
+    encoder.model.eval()
+
+    # 提取嵌入
+    with torch.no_grad():
+        wav = waveform.to(device)
+        embedding = encoder.encode(wav)  # shape: (1, embedding_dim)
+        embedding = embedding.squeeze().cpu().numpy()
+
+    # 保存为 .npy
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    emb_path = output_dir / f"{speaker_name}.npy"
+    np.save(str(emb_path), embedding)
+    logger.info(f"音色向量已保存: {emb_path} (维度: {embedding.shape})")
+    return str(emb_path)
+
+
+# ══════════════════════════════════════════════════════════════
+# 主入口
+# ══════════════════════════════════════════════════════════════
+
+def run_audio_enhance_pipeline(
+    cfg: dict,
+    audio_paths: List[str],
+    temp_dir: str = "temp",
+    output_emb_dir: str = "output/speaker_emb",
+) -> str:
+    """
+    完整音频增强与音色提取流水线
+    参数:
+        cfg: 配置字典
+        audio_paths: 原始音频文件路径列表
+        temp_dir: 临时目录
+        output_emb_dir: 音色向量输出目录
+    返回:
+        speaker_emb_path: 提取的音色向量文件路径
+    """
+    logger.info("=" * 60)
+    logger.info("模块 1: 音频增强与音色提取")
+    logger.info("=" * 60)
+
+    if not audio_paths:
+        raise ValueError("未提供音频文件")
+
+    # 使用第一个音频文件（或合并多个）
+    primary_audio = audio_paths[0]
+    logger.info(f"处理音频: {primary_audio}")
+
+    # 1.1 人声分离
+    vocals_path = separate_vocals_demucs(primary_audio, cfg, temp_dir)
+
+    # 1.2 语音增强
+    enhanced_path = enhance_audio_resemble(vocals_path, cfg, temp_dir)
+
+    # 1.3 最优参考片段选取
+    ref_path = prepare_reference_segment(enhanced_path, cfg, temp_dir)
+
+    # 1.4 提取音色嵌入
+    speaker_name = Path(primary_audio).stem
+    emb_path = extract_speaker_embedding(ref_path, cfg, output_emb_dir, speaker_name)
+
+    logger.info("模块 1 完成!")
+    return emb_path
+
+
+# ── 命令行入口 ───────────────────────────────────────────────
+if __name__ == "__main__":
+    config = load_config()
+    ensure_dirs(config)
+    audio_files = find_audio_files(config["paths"]["input_raw_audio"])
+    if not audio_files:
+        logger.error("input/raw_audio/ 中未找到音频文件")
+        sys.exit(1)
+    run_audio_enhance_pipeline(config, audio_files)
