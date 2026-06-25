@@ -64,6 +64,19 @@ if ! command -v ffmpeg &>/dev/null; then
     warn "安装: brew install ffmpeg"
 fi
 
+# ── HuggingFace 镜像（国内加速） ───────────────────────────
+# 自动检测并启用国内镜像，可通过环境变量 HF_ENDPOINT 覆盖
+if [ -z "${HF_ENDPOINT:-}" ]; then
+    # 检查是否能访问官方站（简单连通性探测）
+    if ! curl -s --max-time 5 https://huggingface.co >/dev/null 2>&1; then
+        if [ -z "${CHATTTS_HF_MIRROR:-}" ]; then
+            CHATTTS_HF_MIRROR="https://hf-mirror.com"
+        fi
+        export HF_ENDPOINT="$CHATTTS_HF_MIRROR"
+        info "启用 HuggingFace 镜像: $HF_ENDPOINT"
+    fi
+fi
+
 # ── 虚拟环境 ───────────────────────────────────────────────
 VENV_DIR="$SCRIPT_DIR/.venv"
 

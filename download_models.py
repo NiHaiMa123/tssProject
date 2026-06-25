@@ -2,6 +2,10 @@
 """
 模型权重下载脚本
 将所有模型下载到本地 models/ 目录，方便离线使用和 git 管理
+
+支持国内镜像加速：
+  - 环境变量 HF_ENDPOINT=https://hf-mirror.com
+  - 环境变量 CHATTTS_HF_MIRROR=https://hf-mirror.com
 """
 
 import os
@@ -11,6 +15,15 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 MODELS_DIR = PROJECT_ROOT / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+# 自动启用国内镜像（如果官方站不可达）
+def _auto_mirror_setup():
+    if "HF_ENDPOINT" not in os.environ:
+        mirror = os.environ.get("CHATTTS_HF_MIRROR", "https://hf-mirror.com")
+        os.environ["HF_ENDPOINT"] = mirror
+        print(f"使用 HuggingFace 镜像: {mirror}")
+
+_auto_mirror_setup()
 
 
 def download_chattts():

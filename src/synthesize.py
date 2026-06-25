@@ -23,6 +23,21 @@ from .text_parser import (
 )
 
 
+def _setup_hf_mirror():
+    """
+    配置 HuggingFace 国内镜像，加速模型下载。
+    优先级：HF_ENDPOINT 环境变量 > CHATTTS_HF_MIRROR 环境变量 > config 配置
+    """
+    if "HF_ENDPOINT" not in os.environ:
+        mirror = os.environ.get("CHATTTS_HF_MIRROR", "")
+        if not mirror:
+            # 尝试从 config 读取（如果已加载）
+            pass
+        if mirror:
+            os.environ["HF_ENDPOINT"] = mirror
+            logger.debug(f"使用 HuggingFace 镜像: {mirror}")
+
+
 # ══════════════════════════════════════════════════════════════
 # ChatTTS 模型加载（单例）
 # ══════════════════════════════════════════════════════════════
@@ -35,6 +50,12 @@ def get_chattts(cfg: dict):
     global _chattts_instance
     if _chattts_instance is not None:
         return _chattts_instance
+
+    # 配置 HuggingFace 镜像加速下载
+    hf_mirror = cfg["chattts"].get("hf_mirror", "")
+    if hf_mirror and "HF_ENDPOINT" not in os.environ:
+        os.environ["HF_ENDPOINT"] = hf_mirror
+        logger.info(f"使用 HuggingFace 镜像: {hf_mirror}")
 
     logger.info("加载 ChatTTS 模型...")
     try:
