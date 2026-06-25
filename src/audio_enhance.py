@@ -1,7 +1,7 @@
 """
 模块 1：参考音频全自动增强与音色提取
 ─────────────────────────────────────────
-流程：人声分离 → 去混响 → 语音增强 → 最优片段选取 → 响度归一化 → 音色嵌入提取
+流程：人声分离 → 语音增强 → 最优片段选取 → 响度归一化 → 音色嵌入提取
 """
 
 import os
@@ -21,6 +21,21 @@ from .utils import (
     load_audio, save_audio, convert_to_mono,
     ebu_r128_normalize, find_audio_files,
 )
+
+
+# --- 兼容性补丁 (Python 3.14 + torchaudio 2.x) ---
+def _apply_wespeaker_patches():
+    """应用 WeSpeaker/s3prl 兼容性补丁"""
+    import torchaudio
+    import types
+    import sys
+    if not hasattr(torchaudio, 'set_audio_backend'):
+        torchaudio.set_audio_backend = lambda x: None
+    if not hasattr(torchaudio, 'sox_effects'):
+        dummy = types.ModuleType('torchaudio.sox_effects')
+        dummy.apply_effects_tensor = lambda *a, **kw: (a[0], a[0].shape[1])
+        torchaudio.sox_effects = dummy
+        sys.modules['torchaudio.sox_effects'] = dummy
 
 
 # ══════════════════════════════════════════════════════════════
@@ -94,20 +109,20 @@ def separate_vocals_demucs(
 
 
 # ══════════════════════════════════════════════════════════════
-# 1.2 去混响与语音增强 (Resemble Enhance)
+# 1.2 语音增强 (DeepFilterNet / noisereduce)
 # ══════════════════════════════════════════════════════════════
 
-def enhance_audio_resemble(
+def enhance_audio_deepfilternet(
     audio_path: str,
     cfg: dict,
     temp_dir: str = "temp",
 ) -> str:
     """
-    使用 Resemble Enhance 进行去混响 + 语音增强
+    使用 DeepFilterNet 进行语音增强（降噪 + 去混响）
     返回: 增强后音频路径
     """
     logger.info("=" * 50)
-    logger.info("步骤 1.2: 语音增强 (Resemble Enhance)")
+    logger.info("步骤 1.2: 语音增强 (DeepFilterNet)")
     logger.info("=" * 50)
 
     if not cfg["enhance"]["enabled"]:
@@ -118,10 +133,10 @@ def enhance_audio_resemble(
     target_sr = cfg["audio"]["enhance_sample_rate"]
 
     try:
-        from resemble_enhance.enhancer.inference import enhance
-        import torchaudio
+        from DeepFilterNet import DeepFilterNet
     except ImportError:
-        raise ImportError("请安装 resemble-enhance: pip install resemble-enhance")
+        logger.warning("DeepFilterNet 未安装，回退到 noisereduce")
+        return _enhance_audio_fallback(audio_path, cfg, temp_dir)
 
     # 加载音频并升频到 48kHz
     waveform, sr = load_audio(audio_path, target_sr=target_sr)
@@ -130,26 +145,66 @@ def enhance_audio_resemble(
     logger.info(f"增强中 (采样率: {target_sr}Hz, 设备: {device})...")
 
     try:
-        # Resemble Enhance 增强
+        model_name = cfg["enhance"].get("deepfilternet_model", "deepfilternet2")
         device_torch = get_device(device)
-        enhanced = enhance(
-            dwav=waveform,
-            sr=target_sr,
-            device=device_torch,
-            nfe=32,                         # 推理步数
-            solver="midpoint",              # 采样器
-            lambd=0.9 if cfg["enhance"]["dereverb"] else 1.0,  # 去混响强度
-            tau=0.5,                        # 降噪强度
-        )
+
+        # 加载模型
+        model = DeepFilterNet.from_pretrained(model_name)
+        model = model.to(device_torch)
+        model.eval()
+
+        # 增强
+        wav_np = waveform.squeeze().cpu().numpy()
+        with torch.no_grad():
+            enhanced_np = model.enhance(wav_np, sr=target_sr)
+
+        enhanced = torch.from_numpy(enhanced_np).float().unsqueeze(0)
+
     except Exception as e:
-        logger.error(f"Resemble Enhance 增强失败: {e}")
-        logger.warning("回退到原始音频")
-        return audio_path
+        logger.error(f"DeepFilterNet 增强失败: {e}")
+        logger.warning("回退到 noisereduce")
+        return _enhance_audio_fallback(audio_path, cfg, temp_dir)
 
     # 保存增强音频
     enhanced_path = str(Path(temp_dir) / "enhanced.wav")
     save_audio(enhanced, target_sr, enhanced_path)
     logger.info(f"语音增强完成: {enhanced_path}")
+    return enhanced_path
+
+
+def _enhance_audio_fallback(
+    audio_path: str,
+    cfg: dict,
+    temp_dir: str = "temp",
+) -> str:
+    """
+    回退方案：使用 noisereduce 进行基础降噪
+    """
+    logger.info("使用 noisereduce 进行基础降噪...")
+
+    try:
+        import noisereduce as nr
+    except ImportError:
+        logger.warning("noisereduce 未安装，跳过增强")
+        return audio_path
+
+    target_sr = cfg["audio"]["enhance_sample_rate"]
+    waveform, sr = load_audio(audio_path, target_sr=target_sr)
+    waveform = convert_to_mono(waveform)
+    wav_np = waveform.squeeze().cpu().numpy()
+
+    # 降噪
+    reduced = nr.reduce_noise(
+        y=wav_np,
+        sr=target_sr,
+        prop_decrease=0.9,
+        stationary=False,
+    )
+
+    enhanced = torch.from_numpy(reduced).float().unsqueeze(0)
+    enhanced_path = str(Path(temp_dir) / "enhanced.wav")
+    save_audio(enhanced, target_sr, enhanced_path)
+    logger.info(f"基础降噪完成: {enhanced_path}")
     return enhanced_path
 
 
@@ -359,37 +414,53 @@ def extract_speaker_embedding(
     speaker_name: str = "speaker",
 ) -> str:
     """
-    使用 WeSpeaker 提取说话人音色向量
+    使用 WeSpeaker / Resemblyzer 提取说话人音色向量
+    优先 WeSpeaker，失败则回退至 Resemblyzer
     返回: 保存的 .npy 文件路径
     """
     logger.info("=" * 50)
-    logger.info("步骤 1.4: 说话人音色嵌入提取 (WeSpeaker)")
+    logger.info("步骤 1.4: 说话人音色嵌入提取")
     logger.info("=" * 50)
 
     target_sr = cfg["audio"]["target_sample_rate"]
     device_str = cfg["speaker_encoder"]["device"]
-    model_name = cfg["speaker_encoder"]["model_name"]
     device = get_device(device_str)
-
-    try:
-        from wespeaker.inference import SpeakerEncoder
-    except ImportError:
-        raise ImportError("请安装 wespeaker: pip install wespeaker")
 
     # 加载音频（24kHz 单声道）
     waveform, sr = load_audio(audio_path, target_sr=target_sr)
     waveform = convert_to_mono(waveform)
 
-    # 初始化说话人编码器
-    encoder = SpeakerEncoder(model_name)
-    encoder.model.to(device)
-    encoder.model.eval()
+    embedding = None
 
-    # 提取嵌入
-    with torch.no_grad():
-        wav = waveform.to(device)
-        embedding = encoder.encode(wav)  # shape: (1, embedding_dim)
-        embedding = embedding.squeeze().cpu().numpy()
+    # 尝试 WeSpeaker
+    try:
+        _apply_wespeaker_patches()
+        from wespeaker.inference import SpeakerEncoder
+        model_name = cfg["speaker_encoder"]["model_name"]
+        encoder = SpeakerEncoder(model_name)
+        encoder.model.to(device)
+        encoder.model.eval()
+
+        with torch.no_grad():
+            wav = waveform.to(device)
+            embedding = encoder.encode(wav)
+            embedding = embedding.squeeze().cpu().numpy()
+
+        logger.info(f"使用 WeSpeaker ({model_name}) 提取音色向量")
+    except Exception as e:
+        logger.warning(f"WeSpeaker 提取失败: {e}，尝试 Resemblyzer...")
+
+    # 回退至 Resemblyzer
+    if embedding is None:
+        try:
+            from resemblyzer import VoiceEncoder
+            encoder = VoiceEncoder(device=device)
+
+            wav_np = waveform.squeeze().cpu().numpy()
+            embedding = encoder.embed_utterance(wav_np, sr=target_sr)
+            logger.info("使用 Resemblyzer 提取音色向量")
+        except Exception as e:
+            raise RuntimeError(f"音色提取失败 (WeSpeaker + Resemblyzer 均不可用): {e}")
 
     # 保存为 .npy
     output_dir = Path(output_dir)
@@ -435,7 +506,7 @@ def run_audio_enhance_pipeline(
     vocals_path = separate_vocals_demucs(primary_audio, cfg, temp_dir)
 
     # 1.2 语音增强
-    enhanced_path = enhance_audio_resemble(vocals_path, cfg, temp_dir)
+    enhanced_path = enhance_audio_deepfilternet(vocals_path, cfg, temp_dir)
 
     # 1.3 最优参考片段选取
     ref_path = prepare_reference_segment(enhanced_path, cfg, temp_dir)

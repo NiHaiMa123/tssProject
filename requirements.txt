@@ -17,15 +17,16 @@ pyloudnorm>=0.1.0           # EBU R128 响度归一化
 # --- 人声分离 (Demucs) ---
 demucs>=4.0.0
 
-# --- 语音增强 (Resemble Enhance) ---
-resemble-enhance>=0.1.0
+# --- 语音增强 (DeepFilterNet 替代 Resemble Enhance) ---
+deepfilternet>=0.5.0
+noisereduce>=3.0.0
 
 # --- VAD ---
 silero-vad>=5.0
 
 # --- 说话人编码器 ---
-wespeaker>=0.1.0
-# 备选: resemblyzer>=0.1.0
+# wespeaker 从 GitHub 安装: pip install git+https://github.com/wenet-e2e/wespeaker.git
+resemblyzer>=0.1.0
 
 # --- TTS (ChatTTS) ---
 ChatTTS>=0.0.8

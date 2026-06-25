@@ -59,6 +59,7 @@ def get_chattts(cfg: dict):
         compile=cfg["chattts"]["compile"],
         device=device,
         source="local",
+        custom_path=str(Path(cfg["paths"].get("models_dir", "models")) / "ChatTTS"),
     )
 
     _chattts_instance = chat

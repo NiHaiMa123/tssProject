@@ -16,12 +16,14 @@ demucs:
   model: "htdemucs"                  # 预训练模型
   device: "mps"                      # 推理设备 (mps / cpu)
 
-# --- 语音增强 (Resemble Enhance) ---
+# --- 语音增强 (DeepFilterNet) ---
 enhance:
   enabled: true
   denoise: true                      # 降噪
   dereverb: true                     # 去混响
   device: "mps"
+  # DeepFilterNet 模型（自动下载，也可指定本地路径）
+  deepfilternet_model: "deepfilternet2"  # deepfilternet2 或 deepfilternet3
 
 # --- VAD (Silero) ---
 vad:
@@ -86,3 +88,4 @@ paths:
   output_audio: "output/audio"
   output_speaker_emb: "output/speaker_emb"
   temp_dir: "temp"
+  models_dir: "models"                 # 本地模型缓存目录
