@@ -83,19 +83,16 @@ def download_demucs():
 
 
 def download_silero_vad():
-    """下载 Silero VAD 模型到 models/silero_vad/"""
+    """下载 Silero VAD 模型（内置在 pip 包中，torch.hub 加载）"""
     print("=" * 50)
     print("下载 Silero VAD 模型...")
     print("=" * 50)
 
     try:
-        from silero_vad import load_silero_vad, get_speech_timestamps
-        
-        output_dir = MODELS_DIR / "silero_vad"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        model = load_silero_vad(model_dir=str(output_dir))
-        print(f"  Silero VAD 模型已保存至: {output_dir}")
+        from silero_vad import load_silero_vad
+        # Silero VAD 模型内置于 pip 包中，加载即可
+        model = load_silero_vad()
+        print("  Silero VAD 模型已就绪（内置于 silero-vad 包）")
         return True
     except Exception as e:
         print(f"  Silero VAD 下载失败: {e}")

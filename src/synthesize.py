@@ -171,8 +171,6 @@ def synthesize_one(
         # ChatTTS 推理
         infer_kwargs = {
             "use_decoder": cfg["chattts"].get("use_decoder", True),
-            "use_oral": False,
-            "use_laugh": False,
             "skip_refine_text": False,
         }
 

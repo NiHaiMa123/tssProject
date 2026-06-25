@@ -260,16 +260,7 @@ def detect_speech_segments(
     except ImportError:
         raise ImportError("请安装 silero-vad: pip install silero-vad")
 
-    project_root = Path(__file__).resolve().parent.parent
-    silero_model_dir = project_root / "models" / "silero_vad"
-    
-    if silero_model_dir.exists():
-        model = load_silero_vad(model_dir=str(silero_model_dir))
-        logger.debug("使用本地 Silero VAD 模型")
-    else:
-        model = load_silero_vad()
-        logger.debug("使用默认 Silero VAD 模型（自动下载）")
-    
+    model = load_silero_vad()
     wav = waveform.squeeze().cpu().numpy()
 
     # Silero VAD 期望 16kHz

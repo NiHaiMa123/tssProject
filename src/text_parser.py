@@ -17,6 +17,22 @@ EMOTION_PATTERN = re.compile(
     r"\[(" + "|".join(EMOTION_LABELS) + r")\]"
 )
 
+# 中文全角标点 → 半角映射（ChatTTS 对全角标点可能报警告）
+_FULLWIDTH_PUNCT = str.maketrans({
+    "！": "!", "？": "?", "。": ".", "，": ",", "；": ";",
+    "：": ":", "（": "(", "）": ")", "＂": '"', "＇": "'",
+    "｀": "`", "～": "~", "＠": "@", "＃": "#", "＄": "$",
+    "％": "%", "＾": "^", "＆": "&", "＊": "*", "＿": "_",
+    "＋": "+", "＝": "=", "｛": "{", "｝": "}", "［": "[",
+    "］": "]", "｜": "|", "＼": "\\", "＜": "<", "＞": ">",
+    "／": "/", "　": " ",
+})
+
+
+def _normalize_text(text: str) -> str:
+    """规范化文本：转换全角标点为半角"""
+    return text.translate(_FULLWIDTH_PUNCT).strip()
+
 
 # ── 文本解析 ─────────────────────────────────────────────────
 def parse_text_with_emotions(text: str) -> List[Tuple[str, str]]:
@@ -43,7 +59,7 @@ def parse_text_with_emotions(text: str) -> List[Tuple[str, str]]:
         if part in EMOTION_LABELS:
             current_emotion = part
         else:
-            segments.append((part, current_emotion))
+            segments.append((_normalize_text(part), current_emotion))
 
     return segments
 
