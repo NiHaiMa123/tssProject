@@ -256,7 +256,7 @@ def synthesize_one(
             # 生成"填充token"，音质沙哑/模糊/失真。ensure_non_empty=True
             # 仅在GPT第1步就EOS时才重新生成(官方机制)，不强制长度。
             kwargs["params_infer_code"] = infer_params_cls(
-                prompt="[speed_5]",
+                prompt="[speed_4]",
                 temperature=emotion_params["temperature"],
                 top_P=emotion_params["top_P"],
                 top_K=20,
@@ -414,7 +414,7 @@ def run_batch_synthesis(
                 + ", ".join(f"{p.name}={_file_rms(p):.4f}" for p in ref_files_by_rms)
             )
 
-            def _select_best_window(wav_1d_local, ref_dur=10.0):
+            def _select_best_window(wav_1d_local, ref_dur=15.0):
                 """在单个参考片段内选最清晰的 ref_dur 秒窗口
                 评分 = 能量 × (1 - 频谱平坦度) × (1 - 静音占比)
                 静音占比高会严重惩罚，避免选到大部分是静音的窗口"""
@@ -466,11 +466,7 @@ def run_batch_synthesis(
                         f"能量 {energy:.6f}, 平坦度 {flatness:.3f}, 静音 {sil*100:.0f}%)"
                     )
 
-                    # 峰值归一化: 防止低能量导致 DVAE 异常 token
-                    peak = float(wav_1d_short.abs().max().item())
-                    if peak > 1e-6 and peak < 0.9:
-                        wav_1d_short = wav_1d_short / peak * 0.9
-                        logger.info(f"  峰值归一化: {peak:.4f} → 0.9")
+                    # 移除峰值归一化: 会改变音色特征，信任 EBU R128 响度归一化已足够
 
                     # ASR 转录，验证文本有效性
                     logger.info("  ASR 转录参考音频 (SenseVoice-Small)...")
@@ -543,10 +539,7 @@ def run_batch_synthesis(
                     if rms < 0.01 or sil > 0.50:
                         continue
                     logger.info(f"  候选窗口 {start_s/target_sr:.0f}s: rms={rms:.4f} silence={sil*100:.0f}%")
-                    # 峰值归一化
-                    peak = float(seg.abs().max().item())
-                    if peak > 1e-6 and peak < 0.9:
-                        seg = seg / peak * 0.9
+                    # 移除峰值归一化: 会改变音色特征
                     # ASR 验证
                     try:
                         txt_try = transcribe_audio(seg, target_sr, language="zh")
@@ -572,20 +565,12 @@ def run_batch_synthesis(
     else:
         logger.info("音色克隆模式: 固定回退音色 (spk_emb)")
 
-    # 逐条合成
+    # 逐条合成并拼接为单个音频文件
     output_files = []
-    file_counter = {}
+    all_wavs = []  # 收集所有合成片段用于最终拼接
+    success_count = 0
 
     for idx, (text, emotion, source_name) in enumerate(units):
-        if source_name not in file_counter:
-            file_counter[source_name] = 0
-        file_counter[source_name] += 1
-        seq = file_counter[source_name]
-
-        safe_name = source_name.replace(" ", "_")
-        out_name = f"{safe_name}_{seq:03d}_{emotion}.wav"
-        out_path = output_dir / out_name
-
         wav = synthesize_one(
             text=text,
             emotion=emotion,
@@ -602,13 +587,34 @@ def run_batch_synthesis(
         )
 
         if wav is not None:
-            save_audio(wav, target_sr, str(out_path), normalize=True)
-            output_files.append(str(out_path))
-            logger.info(f"[{idx+1}/{len(units)}] ✓ {out_name}")
+            all_wavs.append(wav)
+            success_count += 1
+            logger.info(f"[{idx+1}/{len(units)}] ✓ 片段合成成功 [{emotion}]")
         else:
             logger.error(f"[{idx+1}/{len(units)}] ✗ 合成失败: {text[:30]}...")
 
-    logger.info(f"批量合成完成: {len(output_files)}/{len(units)} 成功")
+    # 拼接所有片段为一个音频文件，中间加 0.5 秒静音间隔
+    if all_wavs:
+        silence_dur = 0.5
+        silence = torch.zeros(1, int(silence_dur * target_sr))
+        merged = []
+        for i, w in enumerate(all_wavs):
+            merged.append(w)
+            if i < len(all_wavs) - 1:
+                merged.append(silence)
+        merged_wav = torch.cat(merged, dim=1)
+        # EBU R128 响度归一化整体音频
+        merged_wav = ebu_r128_normalize(merged_wav, target_sr, cfg["audio"]["ebu_r128_target_db"])
+
+        source_name = units[0][2].replace(" ", "_") if units else "output"
+        out_name = f"{source_name}_merged.wav"
+        out_path = output_dir / out_name
+        save_audio(merged_wav, target_sr, str(out_path), normalize=True)
+        output_files.append(str(out_path))
+        total_dur = merged_wav.shape[-1] / target_sr
+        logger.info(f"拼接完成: {out_name} (总时长 {total_dur:.1f}s, {success_count}/{len(units)} 片段)")
+
+    logger.info(f"批量合成完成: {success_count}/{len(units)} 成功")
     return output_files
 
 
