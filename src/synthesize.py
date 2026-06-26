@@ -256,7 +256,7 @@ def synthesize_one(
             # 生成"填充token"，音质沙哑/模糊/失真。ensure_non_empty=True
             # 仅在GPT第1步就EOS时才重新生成(官方机制)，不强制长度。
             kwargs["params_infer_code"] = infer_params_cls(
-                prompt="[speed_2]",
+                prompt="[speed_5]",
                 temperature=emotion_params["temperature"],
                 top_P=emotion_params["top_P"],
                 top_K=20,
@@ -299,7 +299,8 @@ def synthesize_one(
         infer_kwargs = _build_infer_kwargs(None, spk_smp_str, txt_smp)
         for attempt in range(3):
             try:
-                wavs = chat.infer([text], **infer_kwargs)
+                # split_text=False: 避免 ChatTTS 自动切分长文本产生短句吞字 (Issue #907)
+                wavs = chat.infer([text], split_text=False, **infer_kwargs)
                 wav = _extract_wav(wavs)
                 if wav is not None:
                     logger.info(f"  ✓ spk_smp 音色克隆成功 (第 {attempt+1} 次尝试)")
@@ -415,7 +416,7 @@ def run_batch_synthesis(
                 + ", ".join(f"{p.name}={_file_rms(p):.4f}" for p in ref_files_by_rms)
             )
 
-            def _select_best_window(wav_1d_local, ref_dur=15.0):
+            def _select_best_window(wav_1d_local, ref_dur=8.0):
                 """在单个参考片段内选最清晰的 ref_dur 秒窗口
                 评分 = 能量 × (1 - 频谱平坦度) × (1 - 静音占比)
                 静音占比高会严重惩罚，避免选到大部分是静音的窗口"""
