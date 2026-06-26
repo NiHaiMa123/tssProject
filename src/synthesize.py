@@ -251,9 +251,10 @@ def synthesize_one(
             # 官方示例：spk_smp 克隆时不设 spk_emb，避免随机音色干扰
             # spk_smp + txt_smp(参考音频转录) 才是正确的 in-context learning 方式
             effective_spk_emb = spk_emb_val if spk_smp_val is None else None
-            # spk_smp 推理时必须设 min_new_token: GPT 用 spk_smp prompt 时
-            # 首 token 易输出 EOS 导致空输出，强制至少生成 100 token
-            min_nt = 100 if spk_smp_val is not None else 0
+            # 回归官方默认：min_new_token=0 + ensure_non_empty=True
+            # 之前 min_new_token=100 强制禁止前100步输出EOS，导致GPT被迫
+            # 生成"填充token"，音质沙哑/模糊/失真。ensure_non_empty=True
+            # 仅在GPT第1步就EOS时才重新生成(官方机制)，不强制长度。
             kwargs["params_infer_code"] = infer_params_cls(
                 prompt="[speed_5]",
                 temperature=emotion_params["temperature"],
@@ -262,8 +263,8 @@ def synthesize_one(
                 spk_emb=effective_spk_emb,
                 spk_smp=spk_smp_val,
                 txt_smp=txt_smp_val,
-                ensure_non_empty=False,
-                min_new_token=min_nt,
+                ensure_non_empty=True,
+                min_new_token=0,
             )
         return kwargs
 
@@ -281,17 +282,11 @@ def synthesize_one(
                 return None
             wav = torch.tensor(wav).float().unsqueeze(0)
         wav = convert_to_mono(wav)
-        # ── 优化4: 低通滤波抑制高频 artifact ──
-        # 频谱分析发现合成音频 4-8kHz 能量是源音频的 2 倍 (9.9% vs 5.6%)，
-        # 这是"沙哑感"的主要来源。用 8kHz 低通滤波器压制高频噪声。
-        # biquad 低通: 中心频率 8000Hz, Q=0.707 (Butterworth 平坦响应)
-        try:
-            wav = torchaudio.functional.lowpass_biquad(
-                wav, target_sr, cutoff_freq=8000.0, Q=0.707
-            )
-        except Exception:
-            # 极端情况下滤波失败也不影响主流程
-            pass
+        # ── 移除 8kHz 低通滤波 ──
+        # 之前用 lowpass_biquad(cutoff=8000) 完全切除8kHz以上频率，
+        # 损害人声2-5kHz共振峰和8kHz+摩擦音(s/sh/f/h)，导致模糊/发闷。
+        # artifact 的真正根因是 min_new_token=100 强制生成的填充token，
+        # 修复 min_new_token 后不再需要高频抑制。
         wav = ebu_r128_normalize(wav, target_sr, target_lufs)
         return wav
 
