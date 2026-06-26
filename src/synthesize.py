@@ -251,6 +251,9 @@ def synthesize_one(
             # 官方示例：spk_smp 克隆时不设 spk_emb，避免随机音色干扰
             # spk_smp + txt_smp(参考音频转录) 才是正确的 in-context learning 方式
             effective_spk_emb = spk_emb_val if spk_smp_val is None else None
+            # spk_smp 推理时必须设 min_new_token: GPT 用 spk_smp prompt 时
+            # 首 token 易输出 EOS 导致空输出，强制至少生成 100 token
+            min_nt = 100 if spk_smp_val is not None else 0
             kwargs["params_infer_code"] = infer_params_cls(
                 prompt="[speed_5]",
                 temperature=emotion_params["temperature"],
@@ -260,6 +263,7 @@ def synthesize_one(
                 spk_smp=spk_smp_val,
                 txt_smp=txt_smp_val,
                 ensure_non_empty=False,
+                min_new_token=min_nt,
             )
         return kwargs
 
@@ -277,6 +281,17 @@ def synthesize_one(
                 return None
             wav = torch.tensor(wav).float().unsqueeze(0)
         wav = convert_to_mono(wav)
+        # ── 优化4: 低通滤波抑制高频 artifact ──
+        # 频谱分析发现合成音频 4-8kHz 能量是源音频的 2 倍 (9.9% vs 5.6%)，
+        # 这是"沙哑感"的主要来源。用 8kHz 低通滤波器压制高频噪声。
+        # biquad 低通: 中心频率 8000Hz, Q=0.707 (Butterworth 平坦响应)
+        try:
+            wav = torchaudio.functional.lowpass_biquad(
+                wav, target_sr, cutoff_freq=8000.0, Q=0.707
+            )
+        except Exception:
+            # 极端情况下滤波失败也不影响主流程
+            pass
         wav = ebu_r128_normalize(wav, target_sr, target_lufs)
         return wav
 
@@ -386,62 +401,176 @@ def run_batch_synthesis(
     if ref_seg_dir.exists():
         ref_files = sorted(ref_seg_dir.glob("ref_*.wav"))
         if ref_files:
-            ref_path = str(ref_files[0])
-            logger.info(f"从参考音频提取音色: {ref_path}")
-            try:
-                waveform, _ = load_audio(ref_path)
-                waveform = convert_to_mono(waveform)
-                wav_1d = waveform.squeeze(0)
-
-                # 截取能量最高的 3 秒用于 spk_smp 提取
-                # 过长的参考音频会导致 GPT 生成空输出 (第一个 token 即 EOS)
-                # 选取能量最高的窗口，避免截取到静音段
-                max_samples = int(3.0 * target_sr)
-                if len(wav_1d) > max_samples:
-                    best_energy = -1.0
-                    best_start = 0
-                    hop = max(1, max_samples // 30)
-                    for start in range(0, len(wav_1d) - max_samples + 1, hop):
-                        window = wav_1d[start:start + max_samples]
-                        energy = float((window * window).mean().item())
-                        if energy > best_energy:
-                            best_energy = energy
-                            best_start = start
-                    wav_1d_short = wav_1d[best_start:best_start + max_samples]
-                    logger.info(
-                        f"参考音频选取能量最高的 3 秒 "
-                        f"(起始 {best_start / target_sr:.1f}s, 能量 {best_energy:.6f})"
-                    )
-                else:
-                    wav_1d_short = wav_1d
-
-                spk_smp_str = chat.sample_audio_speaker(wav_1d_short)
-                spk_emb_str = None
-                logger.info(f"ChatTTS 说话人编码提取完成 (shape: {wav_1d_short.shape})")
-
-                # ── ASR 转录参考音频，作为 spk_smp 零样本克隆的 txt_smp ──
-                # 官方 example.ipynb 要求：txt_smp 必须与 spk_smp 参考音频内容完全一致
-                # 否则 GPT 无法建立"参考音频token→文字"映射，导致空输出
+            # ── 优化3: 遍历所有参考片段，选 RMS 最高且 ASR 能转录出有效文本的 ──
+            # 历史问题: 只用 ref_files[0] 时若该片段多为静音(rms≈0.018, 静音93%)，
+            # ASR 只能转录出"。"，导致 spk_smp 克隆彻底失败。
+            # 修复: 按 RMS 降序逐个尝试，每个片段内选最清晰窗口 + ASR 验证。
+            def _file_rms(p):
                 try:
-                    logger.info("ASR 转录参考音频 (faster-whisper)...")
-                    txt_smp = transcribe_audio(wav_1d_short, target_sr, language="zh")
-                    if txt_smp:
-                        logger.info(f"  转录结果: \"{txt_smp[:60]}{'...' if len(txt_smp) > 60 else ''}\"")
-                    else:
-                        logger.warning("  ASR 转录结果为空，spk_smp 克隆将无法生效")
-                        spk_smp_str = None
+                    wf, _ = load_audio(str(p))
+                    wf = convert_to_mono(wf)
+                    return float((wf ** 2).mean().sqrt().item())
+                except Exception:
+                    return 0.0
+
+            ref_files_by_rms = sorted(ref_files, key=_file_rms, reverse=True)
+            logger.info(
+                f"参考片段按 RMS 排序: "
+                + ", ".join(f"{p.name}={_file_rms(p):.4f}" for p in ref_files_by_rms)
+            )
+
+            def _select_best_window(wav_1d_local, ref_dur=10.0):
+                """在单个参考片段内选最清晰的 ref_dur 秒窗口
+                评分 = 能量 × (1 - 频谱平坦度) × (1 - 静音占比)
+                静音占比高会严重惩罚，避免选到大部分是静音的窗口"""
+                max_smp = int(ref_dur * target_sr)
+                if len(wav_1d_local) <= max_smp:
+                    return wav_1d_local, 0.0, 0.0, 0.0, 0.0
+                best_sc = -1.0
+                best_st = 0
+                best_e = best_f = best_sil = 0.0
+                hop = max(1, max_smp // 50)
+                wav_np = wav_1d_local.detach().cpu().numpy().astype(np.float32)
+                n_fft = 1024
+                for st in range(0, len(wav_1d_local) - max_smp + 1, hop):
+                    win = wav_np[st:st + max_smp]
+                    energy = float(np.mean(win ** 2))
+                    if energy < 1e-6:
+                        continue
+                    # 静音占比 (|sample| < 0.01 视为静音)
+                    sil_ratio = float(np.mean(np.abs(win) < 0.01))
+                    if sil_ratio > 0.6:
+                        continue  # 静音超 60% 直接跳过
+                    # 频谱平坦度
+                    frames = [win[i:i + n_fft] for i in range(0, len(win) - n_fft, n_fft // 2)]
+                    if not frames:
+                        continue
+                    flats = []
+                    for fr in frames:
+                        spec = np.abs(np.fft.rfft(fr)) + 1e-10
+                        flats.append(np.exp(np.mean(np.log(spec))) / np.mean(spec))
+                    flatness = float(np.mean(flats))
+                    score = energy * (1.0 - flatness) * (1.0 - sil_ratio)
+                    if score > best_sc:
+                        best_sc = score
+                        best_st = st
+                        best_e, best_f, best_sil = energy, flatness, sil_ratio
+                return wav_1d_local[best_st:best_st + max_smp], best_st / target_sr, best_e, best_f, best_sil
+
+            for ref_file in ref_files_by_rms:
+                ref_path = str(ref_file)
+                logger.info(f"尝试参考音频: {ref_path}")
+                try:
+                    waveform, _ = load_audio(ref_path)
+                    waveform = convert_to_mono(waveform)
+                    wav_1d = waveform.squeeze(0)
+
+                    wav_1d_short, start_s, energy, flatness, sil = _select_best_window(wav_1d)
+                    logger.info(
+                        f"  选取最清晰窗口 (起始 {start_s:.1f}s, "
+                        f"能量 {energy:.6f}, 平坦度 {flatness:.3f}, 静音 {sil*100:.0f}%)"
+                    )
+
+                    # 峰值归一化: 防止低能量导致 DVAE 异常 token
+                    peak = float(wav_1d_short.abs().max().item())
+                    if peak > 1e-6 and peak < 0.9:
+                        wav_1d_short = wav_1d_short / peak * 0.9
+                        logger.info(f"  峰值归一化: {peak:.4f} → 0.9")
+
+                    # ASR 转录，验证文本有效性
+                    logger.info("  ASR 转录参考音频 (SenseVoice-Small)...")
+                    txt_smp_try = transcribe_audio(wav_1d_short, target_sr, language="zh")
+                    # 去除标点后检查是否有实际文字内容
+                    txt_clean = re.sub(r"[，。！？、,.!?;:\s]+", "", txt_smp_try or "")
+                    logger.info(f"  转录结果: \"{(txt_smp_try or '')[:60]}\" (有效字符 {len(txt_clean)})")
+
+                    if len(txt_clean) < 2:
+                        logger.warning(f"  该片段 ASR 转录无效(只有标点/空)，尝试下一个参考片段")
+                        continue
+
+                    # 有效：提取 spk_smp 并采用
+                    spk_smp_str = chat.sample_audio_speaker(wav_1d_short)
+                    spk_emb_str = None
+                    txt_smp = txt_smp_try
+                    logger.info(f"  ✓ ChatTTS 说话人编码提取完成 (shape: {wav_1d_short.shape})")
+                    break
                 except Exception as e:
-                    logger.warning(f"ASR 转录失败: {e}，spk_smp 克隆将无法生效")
-                    spk_smp_str = None
-                    txt_smp = None
-            except Exception as e:
-                logger.warning(f"ChatTTS 说话人编码提取失败: {e}，将使用固定回退音色")
+                    logger.warning(f"  参考音频 {ref_path} 处理失败: {e}，尝试下一个")
+                    continue
+            else:
+                logger.warning("所有参考片段均无法产出有效 ASR 文本，尝试直接扫描增强音频...")
                 spk_smp_str = None
                 txt_smp = None
         else:
-            logger.warning("未找到参考片段文件，将使用固定回退音色")
+            logger.warning("未找到参考片段文件，尝试直接扫描增强音频...")
+            spk_smp_str = None
+            txt_smp = None
     else:
-        logger.warning("参考片段目录不存在，将使用固定回退音色")
+        logger.warning("参考片段目录不存在，尝试直接扫描增强音频...")
+        spk_smp_str = None
+        txt_smp = None
+
+    # ── 回退方案: 直接扫描增强/原始音频找有效窗口 ──
+    # 当预处理生成的 ref 片段质量太差(多为静音)导致 ASR 失败时，
+    # 直接在完整音频上滑动搜索一个 10s 窗口: 能量充足 + 静音<50% + ASR有效
+    if spk_smp_str is None:
+        candidate_sources = []
+        enhanced_path = temp_dir / "enhanced.wav"
+        vocals_path = temp_dir / "vocals_separated.wav"
+        if enhanced_path.exists():
+            candidate_sources.append(str(enhanced_path))
+        if vocals_path.exists():
+            candidate_sources.append(str(vocals_path))
+        # 原始音频作为最后兜底
+        raw_dir = Path(cfg["paths"]["input_raw_audio"])
+        if raw_dir.exists():
+            for ext in ("*.wav", "*.mp3", "*.m4a", "*.flac"):
+                candidate_sources.extend(str(p) for p in raw_dir.glob(ext))
+
+        for src_path in candidate_sources:
+            if spk_smp_str is not None:
+                break
+            logger.info(f"直接扫描音频寻找有效参考窗口: {src_path}")
+            try:
+                wf_full, sr_full = load_audio(src_path, target_sr=target_sr)
+                wf_full = convert_to_mono(wf_full).squeeze(0)
+                total_dur = len(wf_full) / target_sr
+                logger.info(f"  音频总长 {total_dur:.1f}s, rms={wf_full.pow(2).mean().sqrt():.4f}")
+
+                win_samples = int(10.0 * target_sr)
+                # 从头到尾以 15s 步长扫描，找第一个有效窗口
+                step_samples = int(15.0 * target_sr)
+                found = False
+                for start_s in range(0, max(0, len(wf_full) - win_samples), step_samples):
+                    seg = wf_full[start_s:start_s + win_samples]
+                    rms = float(seg.pow(2).mean().sqrt().item())
+                    sil = float((seg.abs() < 0.01).float().mean().item())
+                    if rms < 0.01 or sil > 0.50:
+                        continue
+                    logger.info(f"  候选窗口 {start_s/target_sr:.0f}s: rms={rms:.4f} silence={sil*100:.0f}%")
+                    # 峰值归一化
+                    peak = float(seg.abs().max().item())
+                    if peak > 1e-6 and peak < 0.9:
+                        seg = seg / peak * 0.9
+                    # ASR 验证
+                    try:
+                        txt_try = transcribe_audio(seg, target_sr, language="zh")
+                    except Exception as ae:
+                        logger.info(f"    ASR 异常: {ae}")
+                        continue
+                    txt_c = re.sub(r"[，。！？、,.!?;:\s]+", "", txt_try or "")
+                    logger.info(f"    ASR: \"{(txt_try or '')[:50]}\" (有效字符 {len(txt_c)})")
+                    if len(txt_c) >= 2:
+                        spk_smp_str = chat.sample_audio_speaker(seg)
+                        spk_emb_str = None
+                        txt_smp = txt_try
+                        logger.info(f"  ✓ 找到有效参考窗口 ({start_s/target_sr:.0f}s), spk_smp 提取成功")
+                        found = True
+                        break
+                if not found:
+                    logger.warning(f"  在 {src_path} 中未找到有效窗口")
+            except Exception as e:
+                logger.warning(f"  扫描 {src_path} 失败: {e}")
 
     if spk_smp_str is not None and txt_smp:
         logger.info("音色克隆模式: spk_smp + txt_smp (参考音频 in-context learning)")

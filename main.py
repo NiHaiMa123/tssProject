@@ -71,19 +71,8 @@ def main():
         sys.exit(0 if success else 1)
 
     # ── 模块 1：音频增强与音色提取 ──
-    speaker_emb_path = None
 
-    if args.skip_enhance:
-        # 尝试加载已有音色向量
-        emb_dir = Path(cfg["paths"]["output_speaker_emb"])
-        emb_files = list(emb_dir.glob("*.npy"))
-        if emb_files:
-            speaker_emb_path = str(emb_files[0])
-            logger.info(f"跳过增强，使用已有音色向量: {speaker_emb_path}")
-        else:
-            logger.error("跳过增强但未找到已有音色向量，请先运行增强")
-            sys.exit(1)
-    else:
+    if not args.skip_enhance:
         audio_files = find_audio_files(cfg["paths"]["input_raw_audio"])
         if not audio_files:
             logger.error("input/raw_audio/ 中未找到音频文件")
@@ -93,7 +82,7 @@ def main():
         audio_paths = [str(f) for f in audio_files]
         logger.info(f"找到 {len(audio_paths)} 个音频文件")
 
-        speaker_emb_path = run_audio_enhance_pipeline(
+        run_audio_enhance_pipeline(
             cfg=cfg,
             audio_paths=audio_paths,
             temp_dir=cfg["paths"]["temp_dir"],
@@ -102,9 +91,8 @@ def main():
 
     if args.skip_synthesis:
         logger.info("跳过合成阶段（--skip-synthesis）")
-        logger.info(f"音色向量已保存至: {speaker_emb_path}")
         cleanup_temp(cfg["paths"]["temp_dir"])
-        logger.info("流程完成!")
+        logger.info("音频增强与参考片段提取完成!")
         return
 
     # ── 模块 2 & 3：文本解析与批量情感合成 ──
@@ -117,7 +105,6 @@ def main():
 
     output_files = run_batch_synthesis(
         cfg=cfg,
-        speaker_emb_path=speaker_emb_path,
         output_audio_dir=cfg["paths"]["output_audio"],
     )
 
@@ -128,7 +115,6 @@ def main():
     logger.info("=" * 60)
     logger.info("  流水线完成!")
     logger.info("=" * 60)
-    logger.info(f"  音色向量: {speaker_emb_path}")
     logger.info(f"  合成音频: {len(output_files)} 个文件")
     logger.info(f"  输出目录: {cfg['paths']['output_audio']}")
     logger.info("=" * 60)

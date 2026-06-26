@@ -7,8 +7,10 @@ audio:
   target_sample_rate: 24000          # ChatTTS 标准输入采样率
   enhance_sample_rate: 48000        # 增强环节内部升频采样率
   target_channels: 1                 # 单声道
-  segment_duration_min: 10.0         # 最优参考片段最短时长 (秒)
-  segment_duration_max: 15.0         # 最优参考片段最长时长 (秒)
+  segment_duration_min: 10.0         # 单个参考片段最短时长 (秒)
+  segment_duration_max: 15.0         # 单个参考片段最长时长 (秒)
+  num_reference_segments: 5          # 选取参考片段数量（多片段平均提升稳定性）
+  min_segment_gap: 3.0               # 片段之间最小间隔 (秒)，避免过于相似
   ebu_r128_target_db: -23.0         # EBU R128 响度归一化目标 (LUFS)
 
 # --- 人声分离 (Demucs) ---
@@ -47,17 +49,17 @@ emotion:
   default: "neutral"
   neutral_ref: "neutral.wav"         # 默认中性参考音频（必须提供）
   temperature:
-    happy: 0.8
-    sad: 0.6
-    angry: 0.9
-    calm: 0.5
-    neutral: 0.7
+    happy: 0.3
+    sad: 0.3
+    angry: 0.4
+    calm: 0.2
+    neutral: 0.3
   top_P:
-    happy: 0.8
+    happy: 0.7
     sad: 0.7
-    angry: 0.85
-    calm: 0.7
-    neutral: 0.75
+    angry: 0.75
+    calm: 0.6
+    neutral: 0.7
   repetition_penalty:
     happy: 1.5
     sad: 1.8
@@ -67,9 +69,9 @@ emotion:
 
 # --- ChatTTS 合成 ---
 chattts:
-  device: "mps"
+  device: "cpu"
   compile: false                     # torch.compile 加速 (实验性)
-  use_decoder: true                  # 使用 DVAE 解码器
+  use_decoder: false                 # 不用 DVAE 解码器，用 vocos，减少高频 artifact
   # HuggingFace 镜像（国内加速下载），留空使用默认
   # 可选: "https://hf-mirror.com" 或其他镜像地址
   # 也可通过环境变量 HF_ENDPOINT 或 CHATTTS_HF_MIRROR 设置
