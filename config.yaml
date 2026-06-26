@@ -49,17 +49,17 @@ emotion:
   default: "neutral"
   neutral_ref: "neutral.wav"         # 默认中性参考音频（必须提供）
   temperature:
-    happy: 0.3
-    sad: 0.3
-    angry: 0.4
+    happy: 0.2
+    sad: 0.2
+    angry: 0.2
     calm: 0.2
-    neutral: 0.3
+    neutral: 0.2
   top_P:
-    happy: 0.7
-    sad: 0.7
-    angry: 0.75
+    happy: 0.6
+    sad: 0.6
+    angry: 0.6
     calm: 0.6
-    neutral: 0.7
+    neutral: 0.6
   repetition_penalty:
     happy: 1.5
     sad: 1.8
@@ -71,7 +71,7 @@ emotion:
 chattts:
   device: "cpu"
   compile: false                     # torch.compile 加速 (实验性)
-  use_decoder: true                  # 官方默认: 使用 DVAE decoder (artifact 主因是 min_new_token, 非decoder)
+  use_decoder: false                 # vocos 替代 DVAE decoder，减少高频 artifact (沙哑)
   # HuggingFace 镜像（国内加速下载），留空使用默认
   # 可选: "https://hf-mirror.com" 或其他镜像地址
   # 也可通过环境变量 HF_ENDPOINT 或 CHATTTS_HF_MIRROR 设置

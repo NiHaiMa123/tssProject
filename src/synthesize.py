@@ -256,7 +256,7 @@ def synthesize_one(
             # 生成"填充token"，音质沙哑/模糊/失真。ensure_non_empty=True
             # 仅在GPT第1步就EOS时才重新生成(官方机制)，不强制长度。
             kwargs["params_infer_code"] = infer_params_cls(
-                prompt="[speed_4]",
+                prompt="[speed_2]",
                 temperature=emotion_params["temperature"],
                 top_P=emotion_params["top_P"],
                 top_K=20,
@@ -265,6 +265,7 @@ def synthesize_one(
                 txt_smp=txt_smp_val,
                 ensure_non_empty=True,
                 min_new_token=0,
+                manual_seed=42,  # 固定种子，消除首句随机性，解决001不清晰
             )
         return kwargs
 
