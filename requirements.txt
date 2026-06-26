@@ -28,6 +28,10 @@ silero-vad>=5.0
 # wespeaker 从 GitHub 安装: pip install git+https://github.com/wenet-e2e/wespeaker.git
 resemblyzer>=0.1.0
 
+# --- ASR (SenseVoice-Small，阿里通义，中文 CER ~3%) ---
+funasr>=1.3.0
+modelscope>=1.10.0
+
 # --- TTS (ChatTTS) ---
 ChatTTS>=0.0.8
 
