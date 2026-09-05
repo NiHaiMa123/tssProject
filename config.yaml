@@ -1,0 +1,97 @@
+# ============================================================
+# ChatTTS 零样本音色克隆与情感合成流水线 — 配置文件
+# ============================================================
+
+# --- 音频参数 ---
+audio:
+  target_sample_rate: 24000          # ChatTTS 标准输入采样率
+  enhance_sample_rate: 48000        # 增强环节内部升频采样率
+  target_channels: 1                 # 单声道
+  segment_duration_min: 10.0         # 单个参考片段最短时长 (秒)
+  segment_duration_max: 15.0         # 单个参考片段最长时长 (秒)
+  num_reference_segments: 5          # 选取参考片段数量（多片段平均提升稳定性）
+  min_segment_gap: 3.0               # 片段之间最小间隔 (秒)，避免过于相似
+  ebu_r128_target_db: -23.0         # EBU R128 响度归一化目标 (LUFS)
+
+# --- 人声分离 (Demucs) ---
+demucs:
+  model: "htdemucs"                  # 预训练模型
+  device: "mps"                      # 推理设备 (mps / cpu)
+
+# --- 语音增强 (DeepFilterNet) ---
+enhance:
+  enabled: true
+  denoise: true                      # 降噪
+  dereverb: true                     # 去混响
+  device: "mps"
+  # DeepFilterNet 模型（自动下载，也可指定本地路径）
+  deepfilternet_model: "deepfilternet2"  # deepfilternet2 或 deepfilternet3
+
+# --- VAD (Silero) ---
+vad:
+  threshold: 0.5                     # 语音检测阈值 (0~1)
+  min_speech_duration_ms: 250        # 最小语音段 (毫秒)
+  min_silence_duration_ms: 100       # 最小静音间隔 (毫秒)
+
+# --- DNSMOS 质量评分 ---
+dnsmos:
+  enabled: true
+  threshold: 3.0                     # 最低质量阈值 (1~5)
+
+# --- 说话人编码器 (WeSpeaker) ---
+speaker_encoder:
+  model_name: "wespeaker/voxceleb_resnet34_LM"  # 预训练模型
+  device: "mps"
+
+# --- 情感控制 ---
+emotion:
+  labels: ["happy", "sad", "angry", "calm"]
+  default: "neutral"
+  neutral_ref: "neutral.wav"         # 默认中性参考音频（必须提供）
+  temperature:
+    happy: 0.2
+    sad: 0.2
+    angry: 0.2
+    calm: 0.2
+    neutral: 0.2
+  top_P:
+    happy: 0.6
+    sad: 0.6
+    angry: 0.6
+    calm: 0.6
+    neutral: 0.6
+  repetition_penalty:
+    happy: 1.5
+    sad: 1.8
+    angry: 1.3
+    calm: 2.0
+    neutral: 1.5
+
+# --- ChatTTS 合成 ---
+chattts:
+  device: "cpu"
+  compile: false                     # torch.compile 加速 (实验性)
+  use_decoder: false                 # vocos 替代 DVAE decoder，减少高频 artifact (沙哑)
+  # HuggingFace 镜像（国内加速下载），留空使用默认
+  # 可选: "https://hf-mirror.com" 或其他镜像地址
+  # 也可通过环境变量 HF_ENDPOINT 或 CHATTTS_HF_MIRROR 设置
+  hf_mirror: "https://hf-mirror.com"
+
+# --- 自验证 ---
+self_test:
+  # 用于自动下载的示例音频 URL（OpenSLR LibriTTS dev-clean 子集）
+  audio_url: "https://www.openslr.org/resources/60/dev-clean.tar.gz"
+  # 若 URL 不可用，用此备用直链（LibriTTS 示例 wav）
+  audio_url_fallback: "https://us.openslr.org/resources/60/dev-clean.tar.gz"
+  # 自验证输出文件名
+  output_name: "demo_self_test.wav"
+
+# --- 路径 ---
+paths:
+  input_raw_audio: "input/raw_audio"
+  input_texts: "input/texts"
+  input_emotion_ref: "input/emotion_ref"
+  output_audio: "output/audio"
+  output_speaker_emb: "output/speaker_emb"
+  temp_dir: "temp"
+  models_dir: "models"                 # 本地模型缓存目录
